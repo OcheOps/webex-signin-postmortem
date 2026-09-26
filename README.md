@@ -1,147 +1,113 @@
-# Wi-Fi IPv6 "half-up": one app broken, everything else fine
+# Webex "Failed to connect to the server" on Fedora — a debugging post-mortem
 
-Notes from debugging a Fedora laptop where Cisco Webex would not sign in on
-a home Wi-Fi network, while Chrome, WhatsApp, and other apps worked
-normally on the same network.
+Notes from debugging a Fedora laptop where the Cisco Webex desktop client
+would not sign in on a home Wi-Fi network, while Chrome, WhatsApp, and
+other apps worked normally on the same network.
 
-Sharing this because the symptom (one specific app fails to connect while
-everything else works) is easy to blame on the app, but the root cause was
-the local network handing out a broken IPv6 configuration.
+The first diagnosis (IPv6 half-up) turned out to be wrong. The real cause
+was smaller-path MTU on the ISP + a fragile bundled TLS stack in an older
+Webex build. Documenting both because the wrong turn is instructive.
 
 ## Symptom
 
-- Webex login screen shows: **"Failed to connect to the server. Sorry
-  about that. Try again later."**
+- Webex sign-in screen: **"Failed to connect to the server. Sorry about
+  that. Try again later."**
 - Every other app on the laptop works over the same Wi-Fi.
 - Switching to mobile hotspot makes Webex log in immediately.
 
-## Diagnosis
+## First diagnosis (wrong) — IPv6 half-up
 
-Compared IPv4 and IPv6 reachability to a Webex login endpoint:
+The Wi-Fi router advertised an IPv6 default route (`fe80::1 via wlp3s0`)
+but never delivered a global IPv6 prefix. `ip -6 addr show scope global`
+was empty. That is a real problem in its own right — some apps do time
+out on the v6 attempt before falling back to v4 — and it was tempting to
+call it done.
 
-```sh
-$ dig +short A idbroker.example.com
-203.0.113.10
-203.0.113.11
-
-$ dig +short AAAA idbroker.example.com
-2001:db8::10
-2001:db8::11
-
-$ curl -4 -sI --max-time 5 https://idbroker.example.com | head -1
-HTTP/2 404
-
-$ curl -6 -sI --max-time 5 https://idbroker.example.com | head -1
-# (nothing — times out)
-```
-
-IPv4 to that host worked; IPv6 didn't.
-
-Checked the laptop's IPv6 state:
+Applied fix (still applied, still a reasonable state for this network):
 
 ```sh
-$ ip -6 addr show scope global
-# (empty — no global IPv6 address on the Wi-Fi interface)
-
-$ ip -6 route show default
-default via fe80::1 dev wlp3s0 proto ra metric 20600 pref medium
-```
-
-That is the smoking gun. The Wi-Fi router is broadcasting Router
-Advertisements ("I speak IPv6, send v6 traffic to me"), so the laptop
-installs a v6 default route toward it. But the router never delivers a
-global v6 prefix, so the laptop has no v6 source address to send from.
-
-## Why Webex, and not Chrome / WhatsApp?
-
-- DNS returns both A (IPv4) and AAAA (IPv6) records for many services.
-- Modern network stacks run **Happy Eyeballs**: try IPv6 first, fall back
-  to IPv4 after ~300 ms if the v6 attempt doesn't complete.
-- Chromium's built-in resolver (used by Electron apps like Webex) is more
-  aggressive about preferring IPv6 than curl or Firefox.
-- Big consumer apps mostly hit CDNs (Cloudflare, Akamai, Google) that
-  either don't publish AAAA records on this ISP's DNS or return v4 first.
-  Webex's identity/login endpoints publish AAAA prominently, so its login
-  flow runs straight into the black hole and fails before the v4 fallback
-  helps.
-- glibc's `/etc/gai.conf` (`precedence ::ffff:0:0/96 100`) has no effect
-  here — Chromium ignores it and does its own address selection.
-
-## Fix 1 — Laptop only (surgical)
-
-Disable IPv6 on the specific broken Wi-Fi profile via NetworkManager. This
-touches nothing else — other Wi-Fi profiles (office, coffee shops) are
-separate profiles and get their own defaults when the laptop joins them
-for the first time.
-
-```sh
-# Replace <WIFI-NAME> with the SSID (or profile name from `nmcli connection show`)
 sudo nmcli connection modify "<WIFI-NAME>" ipv6.method disabled
 sudo nmcli connection down "<WIFI-NAME>" && sudo nmcli connection up "<WIFI-NAME>"
 ```
 
-To revert later (e.g. if the ISP starts delivering IPv6 properly):
+Result: Webex still failed. IPv6 was a real but unrelated problem.
+
+## Real diagnosis — Path MTU + Webex's bundled TLS
+
+The Webex client log had the actual error the whole time:
+
+```
+Failed to create HTTP request
+uri: https://u2c.wbx2.com
+exception: Error in SSL handshake
+clientErrorCode: 167772294
+```
+
+Two things stacked:
+
+1. **Path MTU is smaller than the Wi-Fi interface MTU.** The route cache
+   showed `mtu 1480` toward Webex hosts while the Wi-Fi interface was set
+   to 1500. `ping -M do -s 1472` returned `sendmsg: Message too long` —
+   the kernel had already learned the path couldn't carry 1500-byte
+   packets. Whenever Webex sent a large TLS ClientHello, the packet would
+   need PMTU discovery to shrink; if ICMP `fragmentation-needed` is
+   blocked upstream (very common on residential ISPs), the packet just
+   vanishes silently and the handshake stalls out. Classic MTU black
+   hole.
+2. **Older Webex build with a fragile bundled TLS config.** Webex 46.8
+   ships an `/opt/Webex/lib/openssl.cnf` that references only a
+   `fips_sect` provider without `activate = 1`, and no default provider
+   fallback. Under some execution paths this leaves the bundled libssl
+   with no active crypto provider, and handshakes fail immediately with
+   an SSL-handshake error even when the network is fine. Newer Webex
+   builds ship a corrected config.
+
+System `curl` and `openssl s_client` succeed to the same hosts because
+they use the system TLS stack and honour the kernel's PMTU cache. The
+Webex client uses its own bundled libcurl + libssl, and doesn't.
+
+## Fixes worth applying if you hit this
+
+### 1. Match Wi-Fi MTU to the real path MTU
 
 ```sh
-sudo nmcli connection modify "<WIFI-NAME>" ipv6.method auto
+sudo nmcli connection modify "<WIFI-NAME>" 802-11-wireless.mtu 1480
 sudo nmcli connection down "<WIFI-NAME>" && sudo nmcli connection up "<WIFI-NAME>"
 ```
 
-### Pros
-- Fixes Webex immediately.
-- Zero risk of breaking anything else.
-- Roams cleanly — other Wi-Fi profiles are untouched.
+Revert later with `... 802-11-wireless.mtu 0`. This costs ~1.3% overhead
+per packet — noise, not felt.
 
-### Cons
-- Every device in the house has to be fixed individually.
-- Guests joining the Wi-Fi still hit the same broken IPv6.
+### 2. Upgrade Webex, don't just reinstall the same version
 
-## Fix 2 — Router (household-wide)
+`sudo dnf upgrade -y webex` — or download the latest `.rpm` from
+https://www.webex.com/downloads.html and install it. Any release newer
+than 46.8 ships a corrected openssl.cnf.
 
-Two acceptable end states on the router's web admin. Router shown here is
-a generic ISP-provided ONT; other models have similar menus.
+### 3. Fall back to the web app
 
-### Option A — Turn off IPv6 RA on the LAN
-Recommended if the ISP is not actually delivering IPv6.
+https://web.webex.com/ works in Chrome and uses the browser's TLS stack,
+which honours PMTU and doesn't have the bundled-config problem. In this
+case that's what I ended up using — the desktop client's fragility isn't
+worth chasing further when the web app does the job.
 
-1. Log in to the router admin page (typically `http://192.168.100.1` or
-   `http://192.168.1.1`). ISPs often issue two accounts — a limited user
-   account and a super-admin account; the WAN pages usually need the
-   super-admin.
-2. **LAN → DHCP Server → IPv6** → disable **RA (Router Advertisement)**.
-3. Apply, reboot the router.
+## Lessons
 
-Result: every device on the LAN gets IPv4 only, automatically. Webex and
-anything else with the same issue starts working.
-
-### Option B — Ask the WAN for a real IPv6 prefix
-Only useful if the ISP actually supports IPv6.
-
-1. **WAN → WAN Configuration** → open the active internet WAN entry.
-2. Set **IPv6 connection type** to **DHCPv6** and enable
-   **Prefix Acquisition = DHCPv6-PD**.
-3. Apply, reboot.
-
-If the WAN pulls a prefix, IPv6 works for the whole house. If not, ISP
-doesn't actually deliver IPv6 to residential yet — fall back to Option A.
-
-### FAQ — will disabling RA hide the Wi-Fi from guests?
-
-No. SSID broadcast and Wi-Fi authentication are 802.11 (Layer 2). RAs are
-Layer 3 IPv6 config, negotiated *after* a device has already associated to
-the AP. The Wi-Fi is still visible and joinable — guests just get IPv4
-only.
-
-## Fix 3 — ISP (upstream)
-
-The real fix is that the router should not be advertising IPv6 as an
-option if the ISP has not delegated a prefix to it. Either turn off RA
-upstream, or start delivering a v6 prefix. See `isp-message.md` for a
-short template.
+- **Don't let the first suspicious clue drown out the actual error
+  message.** The client log said "Error in SSL handshake" from the very
+  first failure. IPv6 was a real but unrelated defect on the network;
+  building the story around it delayed finding the real cause.
+- **Reproduce with system tools first.** `curl -v` and `openssl s_client`
+  against the same hostnames the client is failing on will tell you
+  whether the problem is your network or the app's bundled stack. If
+  system tools succeed and the client fails, the fault is in the app.
+- **MTU black holes are quiet.** Any app that pushes large TLS handshakes
+  (video conferencing, VPN clients, some game launchers) can trip on
+  them. The kernel route cache (`ip route get <ip>`) is where to look.
 
 ## References
 
 - Happy Eyeballs (RFC 8305): https://datatracker.ietf.org/doc/html/rfc8305
-- glibc address selection (`/etc/gai.conf`, RFC 3484 / 6724).
-- Chromium's built-in DNS resolver and address sorting is separate from
-  glibc — it does not honour `gai.conf`.
+- Path MTU Discovery blackhole detection: https://datatracker.ietf.org/doc/html/rfc4821
+- OpenSSL 3 provider activation:
+  https://docs.openssl.org/3.0/man5/config/#provider-configuration
